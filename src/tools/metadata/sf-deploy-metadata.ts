@@ -32,6 +32,22 @@ const deployMetadataParams = z.object({
     .describe('Path to the local source files to deploy. Leave this unset if the user is vague about what to deploy.')
     .optional(),
   manifest: z.string().describe('Full file path for manifest (XML file) of components to deploy.').optional(),
+  // 🆕 AJOUT du paramètre checkOnly
+  checkOnly: z
+    .boolean()
+    .describe(
+      `Validate deployment without actually deploying to the org.
+
+AGENT INSTRUCTIONS:
+Set this to true when user asks for:
+- "validate", "check", "dry-run", "test deployment"
+- "validate my code", "check compilation errors"
+- "deploy --checkonly", "validation only"
+
+Set to false or omit for actual deployments.
+`
+    )
+    .optional(),
   // `RunSpecifiedTests` is excluded on purpose because the tool sets this level when Apex tests to run are passed in.
   //
   // Can be left unset to let the org decide which test level to use:
@@ -73,6 +89,7 @@ export type DeployMetadata = z.infer<typeof deployMetadataParams>;
  * Parameters:
  * - sourceDir: Path to the local source files to deploy.
  * - manifest: Full file path for manifest (XML file) of components to deploy.
+ * - checkOnly: Validate deployment without actually deploying to the org.
  * - apexTestLevel: Apex test level to use during deployment.
  * - apexTests: Apex tests classes to run.
  * - usernameOrAlias: Username or alias of the Salesforce org to deploy to.
@@ -86,15 +103,23 @@ export const registerToolDeployMetadata = (server: SfMcpServer): void => {
     'sf-deploy-metadata',
     `Deploy metadata to an org from your local project.
 
+🆕 VALIDATION SUPPORT:
+Use checkOnly=true to validate deployment without actually deploying (compilation check, syntax validation).
+
 AGENT INSTRUCTIONS:
 If the user doesn't specify what to deploy exactly ("deploy my changes"), leave the "sourceDir" and "manifest" params empty so the tool calculates which files to deploy.
+
+For validation requests, set checkOnly=true.
 
 EXAMPLE USAGE:
 Deploy changes to my org
 Deploy this file to my org
+Validate my changes (checkOnly=true)
+Check compilation errors in my code (checkOnly=true)
 Deploy the manifest
 Deploy X metadata to my org
 Deploy X to my org and run A,B and C apex tests.
+Dry-run deployment to check for errors (checkOnly=true)
 `,
     deployMetadataParams.shape,
     {
@@ -102,7 +127,7 @@ Deploy X to my org and run A,B and C apex tests.
       destructiveHint: true,
       openWorldHint: false,
     },
-    async ({ sourceDir, usernameOrAlias, apexTests, apexTestLevel, directory, manifest }) => {
+    async ({ sourceDir, usernameOrAlias, apexTests, apexTestLevel, directory, manifest, checkOnly }) => {
       if (apexTests && apexTestLevel) {
         return textResponse("You can't specify both `apexTests` and `apexTestLevel` parameters.", true);
       }
@@ -144,12 +169,15 @@ Deploy X to my org and run A,B and C apex tests.
 
         if (componentSet.size === 0) {
           // STL found no changes
-          return textResponse('No local changes to deploy were found.');
+          const actionWord = checkOnly ? 'validate' : 'deploy';
+          return textResponse(`No local changes to ${actionWord} were found.`);
         }
 
+        // 🆕 AJOUT du support checkOnly dans les options de déploiement
         const deploy = await componentSet.deploy({
           usernameOrConnection: connection,
           apiOptions: {
+            checkOnly: checkOnly || false,  // 👈 Paramètre clé ajouté !
             ...(apexTests ? { runTests: apexTests, testLevel: 'RunSpecifiedTests' } : {}),
             ...(apexTestLevel ? { testLevel: apexTestLevel } : {}),
           },
@@ -161,18 +189,33 @@ Deploy X to my org and run A,B and C apex tests.
           timeout: Duration.minutes(10),
         });
 
-        return textResponse(`Deploy result: ${JSON.stringify(result.response)}`, !result.response.success);
+        // 🆕 AMÉLIORATION du message de retour selon le mode
+        const actionWord = checkOnly ? 'Validation' : 'Deploy';
+        const successMessage = checkOnly 
+          ? 'Validation successful - no compilation errors found!' 
+          : 'Deployment completed successfully!';
+        
+        const finalMessage = result.response.success 
+          ? successMessage
+          : `${actionWord} failed - check errors below`;
+
+        return textResponse(
+          `${actionWord} result: ${finalMessage}\n\nDetails: ${JSON.stringify(result.response, null, 2)}`, 
+          !result.response.success
+        );
       } catch (error) {
         const err = SfError.wrap(error);
+        const actionWord = checkOnly ? 'validation' : 'deployment';
+        
         if (err.message.includes('timed out')) {
           return textResponse(
             `
-YOU MUST inform the user that the deploy timed out and if they want to resume the deploy, they can use the #sf-resume tool
+YOU MUST inform the user that the ${actionWord} timed out and if they want to resume the ${actionWord}, they can use the #sf-resume tool
 and ${jobId} for the jobId parameter.`,
             true
           );
         }
-        return textResponse(`Failed to deploy metadata: ${err.message}`, true);
+        return textResponse(`Failed to ${actionWord === 'validation' ? 'validate' : 'deploy'} metadata: ${err.message}`, true);
       }
     }
   );
